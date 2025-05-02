@@ -1,3 +1,4 @@
+import ast
 import os
 import time
 import datetime
@@ -12,6 +13,8 @@ from ib_insync import IB, Stock, util, Order
 import yfinance as yf
 import openai
 from newsapi import NewsApiClient
+from typing import List, Tuple
+import re
 
 # Loading Environment Variables
 load_dotenv()
@@ -26,6 +29,9 @@ EXECUTION_TIME = "09:30"                        # local tz
 TOTAL_CAPITAL = 100_000                        # USD
 NASDAQ_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
 RISK_FREE_TICKER = "IEF"
+
+OPENAI_MODEL = "gpt-4o-mini"
+FIVE_YEAR_PERIOD = "5y"
 
 
 def fetch_risk_free_rate():
@@ -84,105 +90,252 @@ def news_headlines(symbol, lookback_days=30, n=10):
     return [a["title"] for a in articles["articles"]]
 
 
-def estimate_growth_via_gpt(symbol: str, headlines: list[str]) -> float:
-    """
-    Ask GPT for a conservative 5‑year FCF growth rate (in %).
-    Returns a float; falls back to 3.0 on any error / bad parse.
-    """
+def gpt_growth_path(symbol: str, headlines: List[str]) -> List[float]:
     prompt = (
-        f"Given these recent news headlines about {symbol}:\n" +
-        "\n".join(f"- {h}" for h in headlines) +
-        "\nProvide a conservative average annual free‑cash‑flow growth rate (%) "
-        "you expect for the next 5 years. Reply with one number only."
+        f"Recent news headlines for {symbol}:\n"
+        + "\n".join(f"- {h}" for h in headlines)
+        + "\nGive a conservative forecast of the company's free-cash-flow growth "
+          "rate for *each* of the next five years. "
+          "Return a Python list of five percentages, most imminent year first."
     )
-
     try:
-        resp = openai.chat.completions.create(            # ← NEW endpoint path
-            model="gpt-4o-mini",
-            temperature=0.3,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        content = resp.choices[0].message.content.strip()
-        return float(content.strip("% \n"))
+        resp = openai.chat.completions.create(
+            model=OPENAI_MODEL, temperature=0.3,
+            messages=[{"role": "user", "content": prompt}])
+
+        raw = resp.choices[0].message.content.strip(
+        )                                 # — diagnostic
+
+        # pull out the first [...] block
+        m = re.search(r"\[.*?\]", raw, re.S)
+        if not m:
+            raise ValueError("No list of growth rates found")
+        lst = ast.literal_eval(m.group(0))         # safe eval -> list
+
+        # tolerate either strings ("2.0%") or bare numbers (2.0)
+        growths = []
+        for x in lst:
+            if isinstance(x, str):
+                growths.append(float(x.strip("% ")) / 100)
+            else:                                    # int / float
+                growths.append(float(x) / 100)
+
+        # sanity-check length
+        if len(growths) != 5:
+            raise ValueError("Need five growth rates")
     except Exception as e:
-        print(f"[GPT‑fallback] {symbol}: {e}")
-        return 3.0        # ← safe default
+        print("gpt_growth_path Exception:", e)
+        growths = [0.03] * 5                         # fallback flat 3 %
+
+    return growths
+
+
+def gpt_terminal_growth(symbol: str, headlines: List[str]) -> float:
+    """Infer a long‑run terminal FCF growth rate from recent qualitative news."""
+    prompt = (
+        f"Below are several recent news headlines about {symbol}:\n" + "\n".join(f"- {h}" for h in headlines) +
+        "\nBased on this information, what would be a *sustainable long‑run* annual growth rate (in %) for the company's free cash flow beyond year 5? "
+        "Reply with **one number only**."
+    )
+    try:
+        resp = openai.chat.completions.create(model=OPENAI_MODEL, temperature=0.3,
+                                              messages=[{"role": "user", "content": prompt}])
+        val = float(resp.choices[0].message.content.strip().strip("% "))/100
+    except Exception:
+        print("gpt_terminal_growth Exception")
+        val = 0.025   # fallback 2.5 %
+    return val
 
 
 def grab_row(df: pd.DataFrame, aliases: list[str]) -> float:
-    """
-    Return the first non‑NaN value in df for any alias in *aliases*.
-    Raises KeyError if none of the aliases are present.
-    """
+    """Return first non‑NaN value for any alias, case‑insensitive."""
+    if df.empty:
+        raise KeyError("DataFrame empty")
+    idx_l = {i.lower(): i for i in df.index}
     for a in aliases:
-        if a in df.index and not df.loc[a].isna().all():
-            return float(df.loc[a].dropna().iloc[0])
-    raise KeyError(f"None of the aliases {aliases} found in DataFrame")
+        key = a.lower()
+        if key in idx_l and not df.loc[idx_l[key]].isna().all():
+            return float(df.loc[idx_l[key]].dropna().iloc[0])
+    # also try substring match
+    for i in df.index:
+        for a in aliases:
+            if a.lower() in i.lower() and not df.loc[i].isna().all():
+                return float(df.loc[i].dropna().iloc[0])
+    raise KeyError(f"None of the aliases {aliases} found")
 
 
-def dcf_valuation(symbol: str, years: int = 5, terminal_growth: float = 2.5) -> float:
-    """
-    One‑step FCFF DCF.
-    • FCF₀  =  Operating Cash Flow  –  |CapEx|
-      (or use Yahoo’s ‘Free Cash Flow’ line when available)
-    • 5‑year explicit growth  →  GPT‑estimated
-    • WACC  =  r_f  +  β·ERP   (very simplified)
-    Returns intrinsic value per share (USD).
-    """
-    yf_tkr = yf.Ticker(symbol)
-    cf = yf_tkr.cashflow
-    if cf.empty:
-        raise ValueError("No cash‑flow data from Yahoo")
-
+def cost_of_debt_and_tax(tkr: yf.Ticker) -> tuple[float, float]:
+    is_df = tkr.income_stmt if hasattr(tkr, "income_stmt") else tkr.financials
+    bs_df = tkr.balance_sheet
     try:
-        # Try to use Yahoo’s ready‑made FCF line first
-        fcf0 = grab_row(cf, ["Free Cash Flow"])
+        int_exp = abs(grab_row(is_df, ["Interest Expense"]))
+        tot_debt = grab_row(bs_df, ["Total Debt"])
+        cod = int_exp / tot_debt if tot_debt else 0.0
     except KeyError:
-        ocf = grab_row(cf, ["Operating Cash Flow",
-                            "Total Cash From Operating Activities"])
-        capex = grab_row(cf, ["Capital Expenditure",
-                              "Capital Expenditures",
-                              "Net PPE Purchase And Sale"])
-        fcf0 = ocf + capex                 # capex is negative in Yahoo tables
+        cod = 0.03      # fallback 3 %
+    # effective tax rate
+    try:
+        tax = grab_row(is_df, ["Income Tax Expense"])
+        ebt = grab_row(is_df, ["Ebit", "Pretax Income"])
+        tax_rate = tax / ebt if ebt else 0.25
+    except KeyError:
+        tax_rate = 0.25
+    return cod, tax_rate
 
-    # ── growth rate via GPT on recent news ───────────────────
+
+def dcf_valuation(symbol: str) -> float:
+    """Intrinsic value per share (USD) via 5‑year explicit FCF + GPT terminal growth."""
     heads = news_headlines(symbol)
-    g = estimate_growth_via_gpt(symbol, heads) / 100        # decimal
+    growths = gpt_growth_path(symbol, heads)
+    # ← NEW GPT‑driven terminal growth
+    term_g = gpt_terminal_growth(symbol, heads)
 
-    print("GRWOTH: ", g)
+    print("Growth", growths)
+    print("Terminal Growth", term_g)
 
-    # ── discount rate (WACC) ──────────────────────────────────
-    beta = yf_tkr.info.get("beta", 1.0)
-    rf = fetch_risk_free_rate() / 100                        # decimal
-    # equity‑risk premium assumption
-    erp = 0.05
-    wacc = rf + beta * erp
-    print("wacc", wacc)
+    tkr = yf.Ticker(symbol)
 
-    disc = 1 / (1 + wacc)
+    fcf0, method = latest_fcf(symbol, tkr)
+    print("Starting FCF", fcf0)
+    print("Method", method)
 
-    # ── explicit FCF projection ───────────────────────────────
+    disc_rate = wacc(symbol)
+
     pv, fcf = 0.0, fcf0
-
-    print("free cf", fcf0)
-    for t in range(1, years + 1):
+    for t, g in enumerate(growths, 1):
         fcf *= (1 + g)
-        pv += fcf * (disc ** t)
+        pv += fcf * ((1/((1 + disc_rate)**t)))
 
-    print("free cf", fcf)
+    tv = fcf * (1 + term_g)/(disc_rate - term_g)
+    pv += tv * ((1/((1 + disc_rate)**len(growths))))
 
-    # ── terminal value ────────────────────────────────────────
-    tg = terminal_growth / 100
-    tv = fcf * (1 + tg) / (wacc - tg)
-
-    print("terminal value", tv)
-    pv += tv * (disc ** years)
-
-    shares = yf_tkr.info["sharesOutstanding"]
-    intrinsic = pv / shares
-    print(f"[DCF] {symbol}: intrinsic ≈ ${intrinsic:,.2f}  "
-          f"(FCF₀ {fcf0/1e9:,.1f} B, g {g*100:.1f} %, β {beta:.2f})")
+    shares = tkr.info["sharesOutstanding"]
+    intrinsic = pv/shares
+    print(f"[DCF] {symbol}: ${intrinsic:,.2f}  (WACC {disc_rate:.2%}, term g {(term_g*100):.2f} %, FCF via {method})")
     return intrinsic
+
+
+def latest_fcf(symbol: str, ticker: yf.Ticker) -> Tuple[float, str]:
+    """Build trailing FCFF with generous fallbacks – never crash if a tax row is missing."""
+
+    print(ticker.income_stmt)
+    print(ticker.financials)
+
+    # Try the new income_stmt API first, then financials
+    if hasattr(ticker, "income_stmt") and not ticker.income_stmt.empty:
+        fin = ticker.income_stmt
+    else:
+        # explicit fetch
+        ticker.get_financials()
+        fin = ticker.financials
+
+        print(fin)
+
+    if fin.empty:
+        print(
+            f"[WARN] No P&L data for {symbol}, falling back to CF-based FCF.")
+        # Try cashflow directly
+        cf = ticker.cashflow
+        try:
+            op = grab_row(cf, ["Total Cash From Operating Activities"])
+            capx = grab_row(cf, ["Capital Expenditures"])
+            return op - capx, "CF fallback"
+        except KeyError:
+            return 0.0, "no data"
+
+    bs = ticker.balance_sheet
+    cf = ticker.cashflow
+
+    # existing EBIT-based FCFF
+    EBIT = grab_row(fin, ["Ebit", "EBIT", "Operating Income"])
+
+    # tax rows are notoriously inconsistent; treat missing as zero (=> τ = 0.25 fallback)
+    try:
+        tax = grab_row(fin, [
+            "Income Tax Expense", "Provision for Income Taxes", "Income Taxes Paid"
+        ])
+        pretax = grab_row(fin, [
+            "Pretax Income", "Ebt", "Income Before Tax", "Income Before Taxes"
+        ])
+        τ = abs(tax / pretax) if pretax else 0.25
+    except KeyError:
+        τ = 0.25  # flat fallback
+
+    DnA = grab_row(cf, [
+        "Depreciation", "Depreciation & Amortization", "Depreciation & depletion"
+    ])
+
+    CapEx = -grab_row(cf, [
+        "Capital Expenditure", "Capital Expenditures", "Capital Expenditures (purchase of plant, property, and equipment)"
+    ])  # Yahoo values are negative
+
+    # ΔNWC with safety for single‑period balance sheets
+    if not bs.empty and "Total Current Assets" in bs.index and "Total Current Liabilities" in bs.index:
+        nwc = bs.loc["Total Current Assets"] - \
+            bs.loc["Total Current Liabilities"]
+        ΔNWC = nwc.iloc[0] - (nwc.iloc[1] if len(nwc) > 1 else nwc.iloc[0])
+    else:
+        ΔNWC = 0.0
+
+    fcff = EBIT * (1 - τ) + DnA - CapEx - ΔNWC
+    return float(fcff), "EBIT formula (FCFF)"
+
+
+def wacc(symbol: str) -> float:
+    tkr = yf.Ticker(symbol)
+    info = tkr.info
+
+    beta = info.get("beta", 1.0)
+    exp_ret = 0.1  # Hardcoded expected return
+
+    rf = fetch_risk_free_rate()
+
+    print("expected return", exp_ret)
+
+    erp = exp_ret - (rf/100)
+
+    print("risk-free rate", rf)
+    print("risk premium", erp)
+
+    # Equity & Debt totals
+    equity = info.get("marketCap", 0)
+    debt = info.get("totalDebt", 0)
+    if (equity + debt) == 0:
+        raise ValueError("No cap‑structure data")
+
+    w_e = equity/(equity+debt)
+    w_d = 1 - w_e
+
+    print("equity percentage", w_e)
+    print("debt percentage", w_d)
+
+    # Cost of debt = interest expense / total debt
+    fin = tkr.financials
+    try:
+        int_exp = abs(
+            fin.loc[[i for i in fin.index if "interest expense" in i.lower()][0]].dropna().iloc[0])
+        r_d = int_exp/debt
+    except Exception:
+        r_d = 0.04  # 4 % fallback
+
+    print("cost of debt", r_d)
+
+    # Tax rate heuristic (same as earlier)
+    try:
+        tax_exp = fin.loc[[
+            i for i in fin.index if "tax" in i.lower()][0]].dropna().iloc[0]
+        ebt = fin.loc[[i for i in fin.index if "ebt" in i.lower(
+        ) or "pretax" in i.lower()][0]].dropna().iloc[0]
+        tax_rate = abs(tax_exp / ebt) if ebt else 0.25
+    except Exception:
+        tax_rate = 0.25
+    print("tax rate", tax_rate)
+
+    r_e = (rf/100) + beta*erp
+
+    print("Equity rate", r_e)
+    wacc_val = w_e*r_e + w_d*r_d*(1 - tax_rate)
+    return wacc_val
 
 
 def dcf_filter(ib: IB, tickers):
@@ -251,7 +404,7 @@ def rebalance():
     ib.connect('127.0.0.1', 7497, clientId=1)
     print(f"\n=== REBALANCE {datetime.datetime.now()} ===")
 
-    # 1️⃣ Stock universe via DCF
+    # Stock universe via DCF
     candidates = dcf_filter(ib, NASDAQ_TICKERS)
     if not candidates:
         print("No undervalued stocks today.")
@@ -260,15 +413,15 @@ def rebalance():
     risky = candidates
     tickers = risky + [RISK_FREE_TICKER]
 
-    # 2️⃣ Expected returns & cov
+    # Expected returns & cov
     mu, cov = returns_and_cov(ib, tickers)
     rf_ret = mu.pop(RISK_FREE_TICKER)
     cov_risky = cov.loc[risky, risky]
 
-    # 3️⃣ Max‑Sharpe risky portfolio
+    # Max‑Sharpe risky portfolio
     w_risky = optimise_max_sharpe(mu, cov_risky)
 
-    # 4️⃣ Blend with risk‑free via VIX
+    # Blend with risk‑free via VIX
     vix = get_vix_level()
     targ = target_vol_from_vix(vix)
     w_port = blend_with_risk_free(w_risky, cov_risky, targ)
@@ -276,11 +429,10 @@ def rebalance():
     print(f"VIX {vix:.2f} → target σ {targ:.0%}")
     print("Weights:\n", w_port.round(4))
 
-    # 5️⃣ Execute (UNCOMMENT WHEN READY)
+    # Execute (UNCOMMENT WHEN READY)
     # place_orders(ib, w_port, TOTAL_CAPITAL)
 
     ib.disconnect()
-    fetch_risk_free_rate()
     print("Done.\n")
 
 
