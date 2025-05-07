@@ -28,7 +28,7 @@ newsapi = NewsApiClient(api_key=news_key)
 
 TIMEZONE = "America/Vancouver"
 EXECUTION_TIME = "09:30"                        # local tz
-TOTAL_CAPITAL = 100_000                        # USD
+TOTAL_CAPITAL = 100000                        # USD
 NASDAQ_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
 # NASDAQ_TICKERS = ["MSFT"]
 RISK_FREE_TICKER = "IEF"
@@ -189,7 +189,7 @@ def cost_of_debt_and_tax(tkr: yf.Ticker) -> tuple[float, float]:
     return cod, tax_rate
 
 
-def dcf_valuation(symbol: str) -> float:
+def dcf_valuation(symbol: str, rf: float) -> float:
     """Intrinsic value per share (USD) via 5‑year explicit FCF + GPT terminal growth."""
     heads = news_headlines(symbol)
     growths = gpt_growth_path(symbol, heads)
@@ -205,7 +205,7 @@ def dcf_valuation(symbol: str) -> float:
     print("Starting FCF", fcf0)
     print("Method", method)
 
-    disc_rate = wacc(symbol, tkr)
+    disc_rate = wacc(symbol, tkr, rf)
 
     pv, fcf = 0.0, fcf0
     for t, g in enumerate(growths, 1):
@@ -282,19 +282,15 @@ def latest_fcf(symbol: str, ticker: yf.Ticker) -> Tuple[float, str]:
     return float(fcff), "EBIT formula (FCFF)"
 
 
-def wacc(symbol: str, tkr: yf.ticker) -> float:
+def wacc(symbol: str, tkr: yf.ticker, rf: float) -> float:
     info = tkr.info
 
     beta = info.get("beta", 1.0)
     exp_ret = 0.1  # Hardcoded expected return
 
-    rf = fetch_risk_free_rate()
-
     print("expected return", exp_ret)
 
     erp = exp_ret - (rf/100)
-
-    print("risk-free rate", rf)
     print("risk premium", erp)
 
     # Equity & Debt totals
@@ -338,12 +334,12 @@ def wacc(symbol: str, tkr: yf.ticker) -> float:
     return wacc_val
 
 
-def dcf_filter(ib: IB, tickers):
+def dcf_filter(ib: IB, tickers, rf: float):
     selected = []
     for t in tickers:
         try:
             price = fetch_prices_ib(ib, t, duration="3 D").iloc[-1]
-            val = dcf_valuation(t)
+            val = dcf_valuation(t, rf)
             if val >= price:
                 selected.append(t)
         except Exception as e:
@@ -394,21 +390,27 @@ def blend_with_risk_free(w_risky, cov, target_vol):
 # ORDER EXECUTION
 
 
+def get_price(tick):
+    tkr = yf.Ticker(tick, session=session)
+    hist = tkr.history(period="1d")
+    return float(hist["Close"].iloc[-1]) if not hist.empty else float("nan")
+
+
 def place_orders(ib: IB, weights, capital):
     for tick, w in weights.items():
-        if abs(w) < 1e-4:
-            continue
-        alloc = capital*w
+        alloc = capital * w
         contract = Stock(tick, "SMART", "USD")
-        md = ib.reqMktData(contract, "", False, False)
-        ib.sleep(2)
-        price = float(md.last or md.close or 0)
-        if price <= 0:
-            print(f"[SKIP] {tick} price unavailable")
+        price = get_price(tick)
+
+        # skip if price is missing or non‑positive
+        if math.isnan(price) or price <= 0:
+            print(f"[SKIP] {tick} price unavailable (got {price})")
             continue
-        qty = int(alloc//price)
+
+        qty = int(alloc // price)
         if qty == 0:
             continue
+
         order = Order(action="BUY", orderType="MKT", totalQuantity=qty)
         ib.placeOrder(contract, order)
         print(f"BUY {qty} {tick} ≈ ${price:.2f}")
@@ -423,8 +425,12 @@ def rebalance():
     ib.connect('127.0.0.1', 7497, clientId=1)
     print(f"\n=== REBALANCE {datetime.datetime.now()} ===")
 
+    # rfr
+    rf = fetch_risk_free_rate()
+    print("risk-free rate", rf)
+
     # Stock universe via DCF
-    candidates = dcf_filter(ib, NASDAQ_TICKERS)
+    candidates = dcf_filter(ib, NASDAQ_TICKERS, rf)
     print('candidates', candidates)
     if not candidates:
         print("No undervalued stocks today.")
@@ -508,17 +514,17 @@ def rebalance():
 
 
 # SCHEDULER
-# if __name__ == "__main__":
-#     schedule.every().day.at(EXECUTION_TIME).do(rebalance)
-#     print(
-#         f"Scheduler started – will run daily at {EXECUTION_TIME} ({TIMEZONE})")
-#     while True:
-#         schedule.run_pending()
-#         time.sleep(60)
+if __name__ == "__main__":
+    schedule.every().day.at(EXECUTION_TIME).do(rebalance)
+    print(
+        f"Scheduler started – will run daily at {EXECUTION_TIME} ({TIMEZONE})")
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
 
 
 # TESTING PURPOSES
-if __name__ == "__main__":
+# if __name__ == "__main__":
     # print(dcf_valuation("AAPL"))
     # rebalance_test()
-    rebalance()
+    # rebalance()
