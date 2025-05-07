@@ -29,8 +29,8 @@ newsapi = NewsApiClient(api_key=news_key)
 TIMEZONE = "America/Vancouver"
 EXECUTION_TIME = "09:30"                        # local tz
 TOTAL_CAPITAL = 100_000                        # USD
-# NASDAQ_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
-NASDAQ_TICKERS = ["MSFT"]
+NASDAQ_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+# NASDAQ_TICKERS = ["MSFT"]
 RISK_FREE_TICKER = "IEF"
 
 OPENAI_MODEL = "gpt-4o-mini"
@@ -358,7 +358,7 @@ def optimise_max_sharpe(mu: pd.Series, cov: pd.DataFrame) -> pd.Series:
     n = len(mu)
     w = cp.Variable(n)
 
-    # Cholesky factor so that ||L w||₂ = sqrt(wᵀ Σ w)
+    # Cholesky factor (what is this lol)
     L = np.linalg.cholesky(cov.values)
 
     # Objective: maximize μᵀ w
@@ -381,7 +381,11 @@ def optimise_max_sharpe(mu: pd.Series, cov: pd.DataFrame) -> pd.Series:
 
 
 def blend_with_risk_free(w_risky, cov, target_vol):
+
+    # stdev of risky portfolio
     sig = math.sqrt(w_risky.values @ cov.values @ w_risky.values)
+
+    # leverage factor
     lever = target_vol/sig
     w_final = w_risky*lever
     w_final[RISK_FREE_TICKER] = 1-lever
@@ -434,7 +438,7 @@ def rebalance():
     print("expected returns", mu)
     print("covariance", mu)
 
-    # dont need rfr
+    # dont need rfrr
     mu.pop(RISK_FREE_TICKER)
 
     cov_risky = cov.loc[candidates, candidates]
@@ -459,46 +463,48 @@ def rebalance():
 # REBALANCE EVERY DAY yay
 
 
-def rebalance_test():
+# def rebalance_test():
 
-    ib = IB()
+#     ib = IB()
 
-    # 7496: REAL | 7497: PAPER
-    ib.connect('127.0.0.1', 7497, clientId=1)
-    print(f"\n=== REBALANCE {datetime.datetime.now()} ===")
+#     # 7496: REAL | 7497: PAPER
+#     ib.connect('127.0.0.1', 7497, clientId=1)
+#     print(f"\n=== REBALANCE {datetime.datetime.now()} ===")
 
-    # Stock universe via DCF
-    candidates = ["MSFt"]
-    risky = candidates
-    tickers = risky + [RISK_FREE_TICKER]
+#     # Stock universe via DCF
+#     candidates = ["MSFt"]
+#     risky = candidates
+#     tickers = risky + [RISK_FREE_TICKER]
 
-    # Expected returns & cov
-    mu, cov = returns_and_cov(ib, tickers)
+#     # Expected returns & cov
+#     mu, cov = returns_and_cov(ib, tickers)
 
-    print("expected returns", mu)
-    print("covariance", mu)
+#     print("expected returns", mu)
+#     print("covariance", mu)
 
-    rf_ret = mu.pop(RISK_FREE_TICKER)
+#     rf_ret = mu.pop(RISK_FREE_TICKER)
 
-    print("risk free", mu)
-    cov_risky = cov.loc[risky, risky]
+#     print("risk free", mu)
+#     cov_risky = cov.loc[risky, risky]
 
-    # Max‑Sharpe risky portfolio
-    w_risky = optimise_max_sharpe(mu, cov_risky)
+#     # Max‑Sharpe risky portfolio
+#     w_risky = optimise_max_sharpe(mu, cov_risky)
 
-    # Blend with risk‑free via VIX
-    vix = get_vix_level()
-    targ = target_vol_from_vix(vix)
-    w_port = blend_with_risk_free(w_risky, cov_risky, targ)
+#     # Blend with risk‑free via VIX
+#     vix = get_vix_level()
+#     print(vix)
 
-    print(f"VIX {vix:.2f} → target σ {targ:.0%}")
-    print("Weights:\n", w_port.round(4))
+#     targ = target_vol_from_vix(vix)
+#     w_port = blend_with_risk_free(w_risky, cov_risky, targ)
 
-    # Execute (UNCOMMENT WHEN READY)
-    # place_orders(ib, w_port, TOTAL_CAPITAL)
+#     print(f"VIX {vix:.2f} → target σ {targ:.0%}")
+#     print("Weights:\n", w_port.round(4))
 
-    ib.disconnect()
-    print("Done.\n")
+#     # Execute (UNCOMMENT WHEN READY)
+#     # place_orders(ib, w_port, TOTAL_CAPITAL)
+
+#     ib.disconnect()
+#     print("Done.\n")
 
 
 # SCHEDULER
