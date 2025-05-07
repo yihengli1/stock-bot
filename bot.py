@@ -15,6 +15,8 @@ import openai
 from newsapi import NewsApiClient
 from typing import List, Tuple
 import re
+from curl_cffi import requests
+
 
 # Loading Environment Variables
 load_dotenv()
@@ -193,13 +195,15 @@ def dcf_valuation(symbol: str) -> float:
     print("Growth", growths)
     print("Terminal Growth", term_g)
 
-    tkr = yf.Ticker(symbol)
+    # impersonate browser TLS, (patched yfinance api for some reason)
+    session = requests.Session(impersonate="chrome")
+    tkr = yf.Ticker(symbol, session=session)
 
     fcf0, method = latest_fcf(symbol, tkr)
     print("Starting FCF", fcf0)
     print("Method", method)
 
-    disc_rate = wacc(symbol)
+    disc_rate = wacc(symbol, tkr)
 
     pv, fcf = 0.0, fcf0
     for t, g in enumerate(growths, 1):
@@ -218,9 +222,6 @@ def dcf_valuation(symbol: str) -> float:
 def latest_fcf(symbol: str, ticker: yf.Ticker) -> Tuple[float, str]:
     """Build trailing FCFF with generous fallbacks – never crash if a tax row is missing."""
 
-    print(ticker.income_stmt)
-    print(ticker.financials)
-
     # Try the new income_stmt API first, then financials
     if hasattr(ticker, "income_stmt") and not ticker.income_stmt.empty:
         fin = ticker.income_stmt
@@ -228,8 +229,6 @@ def latest_fcf(symbol: str, ticker: yf.Ticker) -> Tuple[float, str]:
         # explicit fetch
         ticker.get_financials()
         fin = ticker.financials
-
-        print(fin)
 
     if fin.empty:
         print(
@@ -281,8 +280,7 @@ def latest_fcf(symbol: str, ticker: yf.Ticker) -> Tuple[float, str]:
     return float(fcff), "EBIT formula (FCFF)"
 
 
-def wacc(symbol: str) -> float:
-    tkr = yf.Ticker(symbol)
+def wacc(symbol: str, tkr: yf.ticker) -> float:
     info = tkr.info
 
     beta = info.get("beta", 1.0)
