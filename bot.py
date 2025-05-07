@@ -29,11 +29,15 @@ newsapi = NewsApiClient(api_key=news_key)
 TIMEZONE = "America/Vancouver"
 EXECUTION_TIME = "09:30"                        # local tz
 TOTAL_CAPITAL = 100_000                        # USD
-NASDAQ_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+# NASDAQ_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+NASDAQ_TICKERS = ["MSFT"]
 RISK_FREE_TICKER = "IEF"
 
 OPENAI_MODEL = "gpt-4o-mini"
 FIVE_YEAR_PERIOD = "5y"
+
+# impersonate browser TLS, (patched yfinance api for some reason)
+session = requests.Session(impersonate="chrome")
 
 
 def fetch_risk_free_rate():
@@ -48,7 +52,7 @@ def fetch_risk_free_rate():
 
 
 def get_vix_level():
-    vix = yf.download("^VIX", period="5d", interval="1d")
+    vix = yf.download("^VIX", period="5d", interval="1d",  session=session)
     return float(vix["Close"].iloc[-1])
 
 
@@ -195,8 +199,6 @@ def dcf_valuation(symbol: str) -> float:
     print("Growth", growths)
     print("Terminal Growth", term_g)
 
-    # impersonate browser TLS, (patched yfinance api for some reason)
-    session = requests.Session(impersonate="chrome")
     tkr = yf.Ticker(symbol, session=session)
 
     fcf0, method = latest_fcf(symbol, tkr)
@@ -352,14 +354,29 @@ def dcf_filter(ib: IB, tickers):
 # MEAN‑VAR OPTIMISATION
 
 # Efficient Frontiers!!
-def optimise_max_sharpe(mu, cov):
+def optimise_max_sharpe(mu: pd.Series, cov: pd.DataFrame) -> pd.Series:
     n = len(mu)
     w = cp.Variable(n)
-    sharpe = (mu.values @ w) / cp.sqrt(cp.quad_form(w, cov.values))
-    prob = cp.Problem(cp.Maximize(sharpe), [cp.sum(w) == 1, w >= 0])
+
+    # Cholesky factor so that ||L w||₂ = sqrt(wᵀ Σ w)
+    L = np.linalg.cholesky(cov.values)
+
+    # Objective: maximize μᵀ w
+    obj = cp.Maximize(mu.values @ w)
+
+    # Constraints: sum(w)=1, w>=0, risk ≤ 1
+    constraints = [
+        cp.sum(w) == 1,
+        w >= 0,
+        cp.norm(L @ w) <= 1
+    ]
+
+    prob = cp.Problem(obj, constraints)
     prob.solve()
+
     if w.value is None:
         raise RuntimeError("MVO failed")
+
     return pd.Series(w.value, index=mu.index)
 
 
@@ -404,16 +421,66 @@ def rebalance():
 
     # Stock universe via DCF
     candidates = dcf_filter(ib, NASDAQ_TICKERS)
+    print('candidates', candidates)
     if not candidates:
         print("No undervalued stocks today.")
         ib.disconnect()
         return
+    tickers = candidates + [RISK_FREE_TICKER]
+
+    # Expected returns & cov
+    mu, cov = returns_and_cov(ib, tickers)
+
+    print("expected returns", mu)
+    print("covariance", mu)
+
+    # dont need rfr
+    mu.pop(RISK_FREE_TICKER)
+
+    cov_risky = cov.loc[candidates, candidates]
+
+    # Max‑Sharpe risky portfolio
+    w_risky = optimise_max_sharpe(mu, cov_risky)
+
+    # Blend with risk‑free via VIX
+    vix = get_vix_level()
+    targ = target_vol_from_vix(vix)
+    w_port = blend_with_risk_free(w_risky, cov_risky, targ)
+
+    print(f"VIX {vix:.2f} → target σ {targ:.0%}")
+    print("Weights:\n", w_port.round(4))
+
+    # Execute (UNCOMMENT WHEN READY)
+    place_orders(ib, w_port, TOTAL_CAPITAL)
+
+    ib.disconnect()
+    print("Done.\n")
+
+# REBALANCE EVERY DAY yay
+
+
+def rebalance_test():
+
+    ib = IB()
+
+    # 7496: REAL | 7497: PAPER
+    ib.connect('127.0.0.1', 7497, clientId=1)
+    print(f"\n=== REBALANCE {datetime.datetime.now()} ===")
+
+    # Stock universe via DCF
+    candidates = ["MSFt"]
     risky = candidates
     tickers = risky + [RISK_FREE_TICKER]
 
     # Expected returns & cov
     mu, cov = returns_and_cov(ib, tickers)
+
+    print("expected returns", mu)
+    print("covariance", mu)
+
     rf_ret = mu.pop(RISK_FREE_TICKER)
+
+    print("risk free", mu)
     cov_risky = cov.loc[risky, risky]
 
     # Max‑Sharpe risky portfolio
@@ -446,5 +513,6 @@ def rebalance():
 
 # TESTING PURPOSES
 if __name__ == "__main__":
-    print(dcf_valuation("AAPL"))
-    # rebalance()
+    # print(dcf_valuation("AAPL"))
+    # rebalance_test()
+    rebalance()
